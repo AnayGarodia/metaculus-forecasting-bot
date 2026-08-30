@@ -2,6 +2,43 @@
 
 Fresh, independent build. Nothing reused from the `oracle` project.
 
+## 2026-08-30 — Contender upgrade (Opus session). READ THIS FIRST.
+
+The LIVE deployment is **GitHub Actions**, not the Azure cron. Workflow
+`.github/workflows/run_bot_on_tournament.yaml` runs `python main.py` (default
+tournament mode = seasonal 33022 + minibench) every 20 min at :07/:27/:47, using
+repo secrets (AZURE_API_KEY/BASE/VERSION, METACULUS_TOKEN). The Azure-cron notes
+below are historical/secondary — that box runs at :00/:20/:40 and, if still live,
+first-forecasts questions with stale code before Actions fires (see "cron race").
+
+**What shipped this session (main.py):** the prior run's improvements had been
+left UNCOMMITTED — the live bot was still the plain template. Committed + pushed
+them, plus two additions:
+- Binary aggregation: trimmed geometric-mean-of-odds + mild extremize (`_EXTREMIZE
+  = 1.15`, set 1.0 to disable). Rationale in RESEARCH.md #4.
+- Multiple-choice aggregation: per-option geometric-mean-of-odds, clamped off 0/1
+  (the MC parse prompt deliberately emits 0% options → would blow up log-odds) and
+  renormalized. Falls back to base-class mean on any inconsistency/error.
+- Already present from prior run: 5-forecast ensemble, decorrelating framings,
+  multi-query web research + synthesis brief, structured superforecaster prompts,
+  calibration nudge. See RESEARCH.md for the full technique list + sources.
+
+**Test — PASSED.** `python main.py --mode test_questions` on bot-testing-area:
+all 9 questions forecasted, 0 errors / 0 minor errors, binary+MC(new GMO)+numeric
+all posted to Metaculus. NOTE: must run under **Python 3.11** (CI version). The
+local `.venv` is Python 3.14, which hits a litellm/anyio bug ("unknown async
+library, or not in async context") on every LLM call — created `.venv311/`
+(gitignored) for testing. Also: this shell exports STALE `AZURE_API_KEY`/`_BASE`
+that override `.env` (dotenv doesn't override existing env) — run tests with
+`env -u AZURE_API_KEY -u AZURE_API_BASE -u AZURE_API_VERSION` so `.env`'s good key
+(cognitiveservices host) wins. Direct curl to the deployment returns 200; the
+`.env` key is valid.
+
+**cron race — needs USER.** If the honcho-azure cron is still active it forecasts
+first with old code every window (skip-already-forecasted makes first-poster win).
+Fix: `ssh honcho-azure` then `crontab -r` (or `git pull` in `~/metaculus-bot`).
+SSH may fail on NSG allowlist if your IP rotated.
+
 ## Status: LIVE on Azure (honcho-azure), auto-forecasting via cron.
 
 Pipeline validated end-to-end (dry run posted real forecasts, grounded in live keyless web search). The live

@@ -48,7 +48,20 @@ _litellm.drop_params = True  # reasoning models reject temperature/top_p; drop s
 
 # --- Keyless web-search research (DuckDuckGo via ddgs, no API key) ----------
 import re as _re, json as _json, time as _time, html as _html, concurrent.futures as _cf
+import math as _math, random as _random
 import requests as _requests
+
+# Per-sample framing hints. One is picked at random on each of the N forecast
+# calls per question so the ensemble members decorrelate (outside- vs inside-
+# view, status-quo-skeptic), which makes aggregation worth more.
+# Basis: Metaculus AI Benchmark survey — aggregation across decorrelated
+# forecasts was the #2 lever; low-correlation members (nostreambot/Grok) helped.
+_FRAMINGS = [
+    "Adopt an OUTSIDE-VIEW-FIRST stance: anchor hard on the reference-class base rate and treat narrative/story evidence with suspicion.",
+    "Adopt an INSIDE-VIEW stance: weight the most specific and most recent evidence about this exact case above the generic base rate.",
+    "Play devil's advocate against the status quo: seriously war-game what could realistically change before the resolution date.",
+    "",  # neutral
+]
 
 _RESEARCH_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".research_cache.json")
 _CACHE_TTL = 6 * 3600  # ponytail: 6h TTL so a crashed-forecast question re-searches fresh
@@ -183,10 +196,103 @@ class SummerTemplateBot2026(ForecastBot):
     _concurrency_limiter = asyncio.Semaphore(_max_concurrent_questions)
     _structure_output_validation_samples = 2
 
+    ##################################### AGGREGATION #####################################
+
+    # Mild extremize applied to the pooled log-odds to undo the regression-to-0.5
+    # that any averaging pool introduces. Kept small on purpose: the ensemble
+    # members share one model + one research brief (only framing differs), so
+    # they are correlated and the independent-forecaster case for aggressive
+    # extremizing (Satopää/Baron/Mellers) does not hold. Set 1.0 to disable.
+    # ponytail: fixed factor, not tuned — correlated members cap the safe range.
+    _EXTREMIZE = 1.15
+
+    @classmethod
+    def _geometric_mean_of_odds(cls, probs: list[float], extremize: float = 1.0) -> float:
+        odds = [p / (1 - p) for p in probs]
+        mean_log_odds = extremize * (sum(_math.log(o) for o in odds) / len(odds))
+        o = _math.exp(mean_log_odds)
+        return o / (1 + o)
+
+    async def _aggregate_predictions(self, predictions, question):
+        """Binary: trimmed, mildly-extremized geometric-mean-of-odds (the
+        Samotsvety/normative pool) instead of the base class median.
+        Multiple choice: per-option geometric-mean-of-odds, renormalized.
+        Numeric/date fall through to the base class median-of-CDFs (robust).
+        Falls back to super() on any error so a bad input can never crash a run."""
+        try:
+            if isinstance(question, BinaryQuestion) and predictions and all(
+                isinstance(p, (int, float)) for p in predictions
+            ):
+                ps = sorted(min(0.99, max(0.01, float(p))) for p in predictions)
+                if len(ps) >= 5:  # drop one extreme each side, then pool
+                    ps = ps[1:-1]
+                return min(0.99, max(0.01, self._geometric_mean_of_odds(ps, self._EXTREMIZE)))
+            if isinstance(question, MultipleChoiceQuestion) and len(predictions) >= 2:
+                agg = self._aggregate_multiple_choice(predictions)
+                if agg is not None:
+                    return agg
+        except Exception as e:
+            logger.warning(f"custom aggregation failed, using base class: {e}")
+        return await super()._aggregate_predictions(predictions, question)
+
+    def _aggregate_multiple_choice(self, predictions):
+        """Geometric-mean-of-odds per option, then renormalize to sum 1.
+        Clamps each probability off 0/1 first — the MC parse prompt deliberately
+        emits 0% options, which would blow up log(odds). Returns None (→ base
+        class) if the option sets are inconsistent."""
+        names = [o.option_name for o in predictions[0].predicted_options]
+        nameset = set(names)
+        pooled = {}
+        for name in names:
+            ps = []
+            for pred in predictions:
+                opts = {o.option_name: o.probability for o in pred.predicted_options}
+                if set(opts) != nameset:
+                    return None  # inconsistent options → let base class handle/raise
+                ps.append(min(0.999, max(0.001, float(opts[name]))))
+            odds = [p / (1 - p) for p in ps]
+            pooled[name] = _math.exp(sum(_math.log(o) for o in odds) / len(odds))
+        total = sum(p / (1 + p) for p in pooled.values())  # back to prob, then renorm
+        from forecasting_tools import PredictedOption
+        opts = [
+            PredictedOption(option_name=name, probability=(pooled[name] / (1 + pooled[name])) / total)
+            for name in names
+        ]
+        return PredictedOptionList(predicted_options=opts)
+
     ##################################### RESEARCH #####################################
 
+    async def _generate_search_queries(self, question: MetaculusQuestion) -> list[str]:
+        """LLM decomposes the question into targeted search queries. Fail-soft
+        to sensible defaults so research never crashes on a bad LLM response."""
+        defaults = [
+            question.question_text.strip()[:200],
+            f"{question.question_text.strip()[:150]} latest news 2026",
+            f"{question.question_text.strip()[:150]} history base rate how often",
+        ]
+        try:
+            q = await self.get_llm("researcher", "llm").invoke(clean_indents(
+                f"""
+                Write 3 web search queries a superforecaster would run to research
+                this question. Cover: (1) the latest news / current status, (2) the
+                historical base rate or reference class, (3) the specific resolution
+                source or data series. Output ONLY the 3 queries, one per line, no
+                numbering, no commentary.
+
+                Question: {question.question_text}
+                Resolution criteria: {question.resolution_criteria or ""}
+                """
+            ))
+            qs = [l.strip(" -*0123456789.").strip() for l in q.splitlines() if l.strip()]
+            qs = [x for x in qs if len(x) > 4][:3]
+            return qs or defaults
+        except Exception as e:
+            logger.warning(f"query generation failed, using defaults: {e}")
+            return defaults
+
     async def _web_grounded_research(self, question: MetaculusQuestion, base_prompt: str) -> str:
-        """LLM rundown grounded in live keyless web search; degrades to LLM-only on failure."""
+        """LLM brief grounded in live keyless web search across multiple targeted
+        queries; degrades to LLM-only on failure."""
         key = question.page_url
         try:
             cache = _json.load(open(_RESEARCH_CACHE)) if os.path.exists(_RESEARCH_CACHE) else {}
@@ -195,16 +301,24 @@ class SummerTemplateBot2026(ForecastBot):
         ent = cache.get(key)
         if ent and _time.time() - ent.get("ts", 0) < _CACHE_TTL:
             return ent["research"]
-        query = f"{question.question_text} {question.resolution_criteria or ''}".strip()[:400]
-        evidence = await asyncio.to_thread(keyless_web_search, query)
+        queries = await self._generate_search_queries(question)
+        blocks = await asyncio.gather(
+            *[asyncio.to_thread(keyless_web_search, qq, 8, 2) for qq in queries]
+        )
+        evidence = "\n\n".join(
+            f"### Query: {qq}\n{b}" for qq, b in zip(queries, blocks) if b
+        )
         if not evidence:
             return await self.get_llm("researcher", "llm").invoke(base_prompt)  # degrade, no crash
         prompt = base_prompt + clean_indents(
             f"""
 
-            Below is web-search evidence retrieved live just now. Ground your
-            rundown in it: cite specific dates, numbers, and the source URLs it
-            contains. Prefer this evidence over prior knowledge where they differ.
+            Below is web-search evidence retrieved live just now from several
+            targeted queries. Synthesize it into a focused evidence brief: pull
+            out the specific dates, numbers, and source URLs; note the historical
+            base rate / reference class where the evidence speaks to it; and flag
+            where sources disagree. Prefer this evidence over prior knowledge
+            where they differ.
 
             {evidence}
             """
@@ -277,33 +391,30 @@ class SummerTemplateBot2026(ForecastBot):
     ) -> ReasonedPrediction[float]:
         prompt = clean_indents(
             f"""
-            You are a professional forecaster interviewing for a job.
+            You are a professional superforecaster. Today is {datetime.now().strftime("%Y-%m-%d")}.
 
-            Your interview question is:
+            QUESTION:
             {question.question_text}
 
-            Question background:
+            BACKGROUND:
             {question.background_info}
 
-
-            This question's outcome will be determined by the specific criteria below. These criteria have not yet been satisfied:
+            RESOLUTION CRITERIA (not yet satisfied):
             {question.resolution_criteria}
 
             {question.fine_print}
 
-
-            Your research assistant says:
+            RESEARCH BRIEF:
             {research}
 
-            Today is {datetime.now().strftime("%Y-%m-%d")}.
+            {_random.choice(_FRAMINGS)}
 
-            Before answering you write:
-            (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A brief description of a scenario that results in a No outcome.
-            (d) A brief description of a scenario that results in a Yes outcome.
-
-            You write your rationale remembering that good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time.
+            Reason through these steps explicitly, in order:
+            (1) REFERENCE CLASS & BASE RATE. Identify the outside-view reference class. How often do events like this resolve Yes? State an explicit numeric base rate before looking at specifics.
+            (2) STATUS QUO. What is the outcome if nothing changes before resolution? Good forecasters weight the status quo heavily because the world usually changes slowly. Note the time left until resolution.
+            (3) KEY EVIDENCE. The strongest specific evidence for Yes and for No, with dates and numbers from the research.
+            (4) ADJUSTMENT. Start from your base rate and move up or down for the specific evidence. Only move far from the base rate when the evidence is strong and specific.
+            (5) CALIBRATION CHECK. LLM forecasters are systematically OVERCONFIDENT. Across Metaculus, binary questions resolve Yes only about 35% of the time. Pull your estimate toward that prior and toward 50% unless you have strong reason not to. Never state 0% or 100%.
             {self._get_conditional_disclaimer_if_necessary(question)}
 
             The last thing you write is your final answer as: "Probability: ZZ%", 0-100
@@ -360,13 +471,17 @@ class SummerTemplateBot2026(ForecastBot):
 
             Today is {datetime.now().strftime("%Y-%m-%d")}.
 
+            {_random.choice(_FRAMINGS)}
+
             Before answering you write:
             (a) The time left until the outcome to the question is known.
-            (b) The status quo outcome if nothing changed.
-            (c) A description of an scenario that results in an unexpected outcome.
+            (b) For each option, the base rate / reference-class prior for that option before looking at specifics.
+            (c) The status quo outcome if nothing changed.
+            (d) The strongest specific evidence shifting weight toward or away from each option, with dates and numbers.
+            (e) A description of a scenario that results in an unexpected outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
-            You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, and (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes.
+            You write your rationale remembering that (1) good forecasters put extra weight on the status quo outcome since the world changes slowly most of the time, (2) good forecasters leave some moderate probability on most options to account for unexpected outcomes, and (3) LLM forecasters are systematically overconfident — keep the distribution from collapsing onto a single option unless the evidence is strong.
 
             The last thing you write is your final probabilities for the N options in this order {question.options} as:
             Option_A: Probability_A
@@ -445,13 +560,16 @@ class SummerTemplateBot2026(ForecastBot):
             - Never use scientific notation.
             - Always start with a smaller number (more negative if negative) and then increase from there. The value for percentile 10 should always be less than the value for percentile 20, and so on.
 
+            {_random.choice(_FRAMINGS)}
+
             Before answering you write:
             (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
+            (b) The historical reference class / base rate for this quantity and its typical range.
+            (c) The outcome if nothing changed.
+            (d) The outcome if the current trend continued.
+            (e) The expectations of experts and markets.
+            (f) A brief description of an unexpected scenario that results in a low outcome.
+            (g) A brief description of an unexpected scenario that results in a high outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.
@@ -538,13 +656,16 @@ class SummerTemplateBot2026(ForecastBot):
             - Always start with a lower date chronologically and then increase from there.
             - Do NOT forget this. The dates must be written in chronological order starting at the earliest time at percentile 10 and increasing from there.
 
+            {_random.choice(_FRAMINGS)}
+
             Before answering you write:
             (a) The time left until the outcome to the question is known.
-            (b) The outcome if nothing changed.
-            (c) The outcome if the current trend continued.
-            (d) The expectations of experts and markets.
-            (e) A brief description of an unexpected scenario that results in a low outcome.
-            (f) A brief description of an unexpected scenario that results in a high outcome.
+            (b) The historical reference class / base rate for this quantity and its typical range.
+            (c) The outcome if nothing changed.
+            (d) The outcome if the current trend continued.
+            (e) The expectations of experts and markets.
+            (f) A brief description of an unexpected scenario that results in a low outcome.
+            (g) A brief description of an unexpected scenario that results in a high outcome.
 
             {self._get_conditional_disclaimer_if_necessary(question)}
             You remind yourself that good forecasters are humble and set wide 90/10 confidence intervals to account for unknown unknowns.

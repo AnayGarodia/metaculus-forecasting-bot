@@ -171,3 +171,7 @@ cython_debug/
 
 # MacOS
 .DS_Store
+
+# local 3.11 test venv (matches CI python)
+.venv311/
+.research_cache.json
